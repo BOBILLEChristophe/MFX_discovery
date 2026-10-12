@@ -1,90 +1,362 @@
 /*
-   rocrail_mfx_discovery
+   mfx_discovery - v0.4
+   ------------------------------------------------------------------
+   Decouverte MFX (UID 32 bits) et attribution d'une adresse courte
+   (SID) sur le bus CAN Marklin (250 kbit/s).
 
-    Programme permettant la reconnaissance MFX
-    et la mise à jour de la liste des locomotives dans Rocrail©
+   Corrections par rapport a la v0.3 :
+     - Discovery envoye avec la bonne commande (0x01, pas 0x00)
+     - Filtre de reception : commande et bit de reponse extraits
+       proprement (les bits de priorite ne perturbent plus le test)
+     - Tableau de locos initialise ; emplacements vides ignores
+     - Compteur d'identifiants sur 16 bits, encodage correct
+     - Machine d'etats par loco : Bind -> Verify -> confirmation,
+       avec renvoi (3 essais maximum)
+     - Decouverte relancable (commande serie 'd')
+     - Arret en cas d'echec d'initialisation du CAN
+     - Plus de delay() dans le traitement des trames
+     - Classe CanMsg supprimee (conflit avec le projet principal)
+
+   Commandes serie :  d = relancer la decouverte, l = lister les locos
+
+   NOTE : pour piloter une loco MFX, le Loc-ID CAN est 0x4000 | SID
+          (DCC : 0xC000 | adresse, MM : 0x0000 | adresse).
 */
 
 #ifndef ARDUINO_ARCH_ESP32
 #error "Select an ESP32 board"
 #endif
 
-#define PROJECT "MFX_discovery"
-#define VERSION "0.3"
-#define AUTHOR "Christophe BOBILLE"
-
 #include <Arduino.h>
 #include <ACAN_ESP32.h>  // https://github.com/pierremolinaro/acan-esp32.git
-#include <Ethernet.h>
 
-CANMessage frameIn;
-CANMessage frameOut;
+#define PROJECT "MFX_discovery"
+#define VERSION "0.4"
+#define AUTHOR "Christophe BOBILLE"
 
-/* ----- CAN Configuration ------ */
-// #define CAN_RX GPIO_NUM_21
-// #define CAN_TX GPIO_NUM_22
-#define CAN_RX GPIO_NUM_22 // Optional, default Rx pin is GPIO_NUM_5
-#define CAN_TX GPIO_NUM_23 // Optional, default Tx pin is GPIO_NUM_4
-#define CAN_BITRATE 250UL * 1000UL  // Marklin CAN baudrate = 250Kbit/s
+// ---------------------------------------------------------------
+// CAN
+// ---------------------------------------------------------------
+static constexpr gpio_num_t CAN_RX_PIN = GPIO_NUM_22;
+static constexpr gpio_num_t CAN_TX_PIN = GPIO_NUM_23;
 
-class CanMsg {
-public:
-  uint32_t id;
-  uint8_t len;
-  uint8_t command;
-  uint8_t data[8];
-  uint16_t hash;
+constexpr uint32_t CAN_BITRATE = 250UL * 1000UL;  // Marklin
+constexpr uint16_t CAN_HASH = 0x2f39;
+
+// Commandes
+constexpr uint8_t CMD_SYSTEM = 0x00;
+constexpr uint8_t CMD_DISCOVERY = 0x01;
+constexpr uint8_t CMD_MFX_BIND = 0x02;
+constexpr uint8_t CMD_MFX_VERIFY = 0x03;
+constexpr uint8_t CMD_BOOTLOADER = 0x1B;
+
+// Sous-commandes systeme
+constexpr uint8_t SYS_STOP = 0x00;
+constexpr uint8_t SYS_GO = 0x01;
+constexpr uint8_t SYS_MFX_COUNTER = 0x09;
+
+// Valeur reprise telle quelle de la v0.3.
+// A VALIDER dans la specification du protocole CAN.
+constexpr uint8_t MFX_DISCOVERY_PROTOCOL = 0x20;
+
+constexpr uint16_t MFX_LOC_ID_BASE = 0x4000;
+
+// ---------------------------------------------------------------
+// Liste des locomotives
+// ---------------------------------------------------------------
+
+constexpr uint8_t MAX_LOCOS = 40;
+constexpr uint32_t BIND_TO_VERIFY_MS = 20;
+constexpr uint32_t VERIFY_TIMEOUT_MS = 1000;
+constexpr uint8_t MAX_TRIES = 3;
+
+enum class LocoState : uint8_t {
+  FREE,         // emplacement libre
+  NEW,          // Bind a envoyer
+  BIND_SENT,    // Bind envoye, Verify a envoyer
+  VERIFY_SENT,  // Verify envoye, attente de la reponse
+  CONFIRMED,    // loco confirmee
+  FAILED        // pas de confirmation apres MAX_TRIES essais
 };
 
-CanMsg canMsg;
-
-const byte nbLocos = 40;  // Le nombre de locos est fixé arbitrairement à 40. Peut être modifié en + ou en -
-
-class Loco {
-public:
-  Loco();
-  uint8_t index;
-  uint8_t locID[2];
-  uint8_t UID[4];
-  static uint8_t comptLoco;  // compteur de locos "static" (indépendant des instances)
+struct MfxLoco {
+  LocoState state = LocoState::FREE;
+  uint8_t uid[4] = { 0, 0, 0, 0 };
+  uint16_t sid = 0;  // adresse courte attribuee
+  uint8_t tries = 0;
+  uint32_t lastSendMs = 0;
 };
 
-uint8_t Loco::comptLoco = 4;  // début du compteur
-Loco::Loco()
-  : index(255){};  // constructeur
+MfxLoco locos[MAX_LOCOS];
 
-Loco* loco = new Loco[nbLocos];  // instance loco de la classe Loco -> loco est un tableau de 40 (nbLocos) locomotives
+// Dernier SID attribue : le premier attribue sera 5 (comme en v0.3).
+uint16_t lastSid = 4;
 
-bool err;
+// ---------------------------------------------------------------
+// Utilitaires
+// ---------------------------------------------------------------
 
-String decToHex(uint8_t dec) {
-  auto convert = [](uint8_t x) -> char {
-    return (x >= 10) ? (char)(x + 55) : (char)(x + 48);
-  };
-  String hex = "";
-  hex += convert(dec / 16);
-  hex += convert(dec % 16);
-  return hex;
-}
-
-bool sendMsgCan(uint8_t CAN_Command, uint8_t length, uint8_t* canSendData) {
-  canMsg.id = CAN_Command << 17 | canMsg.hash;
-  frameOut.id = canMsg.id;
-  frameOut.ext = 1;
-  frameOut.len = length;
-  memcpy(frameOut.data, canSendData, length);
-  err = ACAN_ESP32::can.tryToSend(frameOut);
-  if (err) {
-    Serial.print("[ ]=> command 0x");
-    Serial.println(decToHex(CAN_Command));
+const char* stateName(LocoState s) {
+  switch (s) {
+    case LocoState::FREE: return "libre";
+    case LocoState::NEW: return "nouvelle";
+    case LocoState::BIND_SENT: return "bind envoye";
+    case LocoState::VERIFY_SENT: return "verify envoye";
+    case LocoState::CONFIRMED: return "confirmee";
+    case LocoState::FAILED: return "ECHEC";
   }
-  return err;
+  return "?";
 }
 
-void sendMFXBind(Loco& loco);
-void sendMFXVerify(Loco& loco);
-void sendInitialCANCommands();
-void processCANFrame();
+void printUid(const uint8_t* u) {
+  Serial.printf("%02X%02X%02X%02X", u[0], u[1], u[2], u[3]);
+}
+
+// ---------------------------------------------------------------
+// Emission CAN
+// ---------------------------------------------------------------
+
+bool sendCan(uint8_t command, const uint8_t* data, uint8_t len) {
+  CANMessage frame;
+  frame.id = (static_cast<uint32_t>(command) << 17) | CAN_HASH;
+  frame.ext = true;
+  frame.len = len;
+  if (len > 0)
+    memcpy(frame.data, data, len);
+
+  const bool ok = ACAN_ESP32::can.tryToSend(frame);
+  if (!ok)
+    Serial.printf("[!] echec d'envoi, commande 0x%02X\n", command);
+  return ok;
+}
+
+// Commande systeme : UID = 0 (tous), sous-commande, donnees eventuelles.
+bool sendSystem(uint8_t sub, const uint8_t* extra = nullptr, uint8_t extraLen = 0) {
+  uint8_t d[8] = { 0 };
+  d[4] = sub;
+  if (extra != nullptr && extraLen <= 3)
+    memcpy(&d[5], extra, extraLen);
+  return sendCan(CMD_SYSTEM, d, 5 + extraLen);
+}
+
+// Bind / Verify : UID (4 octets) + SID (2 octets).
+bool sendUidSid(uint8_t command, const MfxLoco& l) {
+  uint8_t d[6];
+  memcpy(d, l.uid, 4);
+  d[4] = (l.sid >> 8) & 0xFF;
+  d[5] = l.sid & 0xFF;
+  return sendCan(command, d, 6);
+}
+
+void startDiscovery() {
+  const uint8_t d[1] = { MFX_DISCOVERY_PROTOCOL };
+  sendCan(CMD_DISCOVERY, d, 1);
+  Serial.println("Discovery MFX lance");
+}
+
+// Sequence de demarrage. Les delay() ne concernent que setup().
+void runStartSequence() {
+  uint8_t d[8];
+
+  // 2.1 Systeme Arret.
+  // DLC 5 avec sous-commande explicite (la v0.3 utilisait DLC 4).
+  // A VALIDER dans la specification.
+  delay(1000);
+  sendSystem(SYS_STOP);
+
+  // Bootloader CAN (conserve tel quel de la v0.3)
+  delay(1000);
+  memset(d, 0, sizeof(d));
+  d[4] = 0x11;
+  sendCan(CMD_BOOTLOADER, d, 5);
+
+  // 2.10 Systeme MFX : compteur de nouvelles inscriptions (16 bits)
+  delay(1000);
+  const uint8_t counter[2] = {
+    static_cast<uint8_t>((lastSid >> 8) & 0xFF),
+    static_cast<uint8_t>(lastSid & 0xFF)
+  };
+  sendSystem(SYS_MFX_COUNTER, counter, 2);
+
+  // 3.3 MFX Verify global (UID = 0, SID = 0) pour provoquer un UnBIND
+  delay(1000);
+  memset(d, 0, sizeof(d));
+  sendCan(CMD_MFX_VERIFY, d, 6);
+
+  // 2.2 Systeme Go
+  delay(1000);
+  sendSystem(SYS_GO);
+
+  // 3.1 Discovery
+  delay(1000);
+  startDiscovery();
+}
+
+// ---------------------------------------------------------------
+// Reception CAN
+// ---------------------------------------------------------------
+
+MfxLoco* findLoco(const uint8_t* uid) {
+  for (auto& l : locos) {
+    if (l.state != LocoState::FREE && memcmp(l.uid, uid, 4) == 0)
+      return &l;
+  }
+  return nullptr;
+}
+
+void onDiscoveryResponse(const uint8_t* data) {
+  MfxLoco* known = findLoco(data);
+
+  if (known != nullptr) {
+    // Une loco deja en cours de traitement est laissee tranquille.
+    // Si elle etait confirmee (ou en echec) et se re-annonce, elle a
+    // perdu son SID : on le lui redonne (meme SID).
+    if (known->state == LocoState::CONFIRMED || known->state == LocoState::FAILED) {
+      Serial.print("Loco deja connue, nouvelle liaison : UID ");
+      printUid(known->uid);
+      Serial.printf("  SID %u\n", known->sid);
+      known->tries = 0;
+      known->state = LocoState::NEW;
+    }
+    return;
+  }
+
+  for (auto& slot : locos) {
+    if (slot.state == LocoState::FREE) {
+      memcpy(slot.uid, data, 4);
+      slot.sid = ++lastSid;
+      slot.tries = 0;
+      slot.state = LocoState::NEW;
+
+      Serial.print("Nouvelle loco : UID ");
+      printUid(slot.uid);
+      Serial.printf("  SID %u  (Loc-ID CAN 0x%04X)\n", slot.sid, MFX_LOC_ID_BASE | slot.sid);
+      return;
+    }
+  }
+
+  Serial.println("[!] Liste pleine : loco ignoree");
+}
+
+void onVerifyResponse(const uint8_t* data) {
+  MfxLoco* l = findLoco(data);
+  if (l == nullptr)
+    return;
+
+  const uint16_t sid = (static_cast<uint16_t>(data[4]) << 8) | data[5];
+
+  if (sid != l->sid) {
+    Serial.print("[!] Verify : SID different pour UID ");
+    printUid(l->uid);
+    Serial.printf(" (recu %u, attendu %u)\n", sid, l->sid);
+    return;
+  }
+
+  if (l->state == LocoState::VERIFY_SENT || l->state == LocoState::BIND_SENT) {
+    l->state = LocoState::CONFIRMED;
+    Serial.print("Loco confirmee : UID ");
+    printUid(l->uid);
+    Serial.printf("  SID %u  (Loc-ID CAN 0x%04X)\n", l->sid, MFX_LOC_ID_BASE | l->sid);
+  }
+}
+
+void processCanFrame(const CANMessage& f) {
+  if (!f.ext || f.rtr)
+    return;
+
+  const uint8_t command = (f.id >> 17) & 0xFF;
+  const bool response = ((f.id >> 16) & 0x01) != 0;
+
+  if (!response)
+    return;
+
+  if (command == CMD_DISCOVERY && f.len == 5)
+    onDiscoveryResponse(f.data);
+  else if (command == CMD_MFX_VERIFY && f.len >= 6)
+    onVerifyResponse(f.data);
+}
+
+// ---------------------------------------------------------------
+// Machine d'etats des locos (non bloquante)
+// ---------------------------------------------------------------
+
+void serviceLocos() {
+  const uint32_t now = millis();
+
+  for (auto& l : locos) {
+    switch (l.state) {
+      case LocoState::NEW:
+        sendUidSid(CMD_MFX_BIND, l);
+        l.lastSendMs = now;
+        l.state = LocoState::BIND_SENT;
+        break;
+
+      case LocoState::BIND_SENT:
+        if (now - l.lastSendMs >= BIND_TO_VERIFY_MS) {
+          sendUidSid(CMD_MFX_VERIFY, l);
+          l.lastSendMs = now;
+          l.state = LocoState::VERIFY_SENT;
+        }
+        break;
+
+      case LocoState::VERIFY_SENT:
+        if (now - l.lastSendMs >= VERIFY_TIMEOUT_MS) {
+          l.tries++;
+          if (l.tries < MAX_TRIES) {
+            Serial.print("Pas de reponse Verify, nouvel essai : UID ");
+            printUid(l.uid);
+            Serial.println();
+            l.state = LocoState::NEW;
+          } else {
+            Serial.print("[!] Pas de confirmation apres ");
+            Serial.print(MAX_TRIES);
+            Serial.print(" essais : UID ");
+            printUid(l.uid);
+            Serial.println();
+            l.state = LocoState::FAILED;
+          }
+        }
+        break;
+
+      default:
+        break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// Commandes serie
+// ---------------------------------------------------------------
+
+void listLocos() {
+  Serial.println("---- Locomotives MFX ----");
+  bool any = false;
+  for (uint8_t i = 0; i < MAX_LOCOS; i++) {
+    const MfxLoco& l = locos[i];
+    if (l.state == LocoState::FREE)
+      continue;
+    any = true;
+    Serial.printf("[%2u] UID ", i);
+    printUid(l.uid);
+    Serial.printf("  SID %u  Loc-ID 0x%04X  %s\n", l.sid, MFX_LOC_ID_BASE | l.sid, stateName(l.state));
+  }
+  if (!any)
+    Serial.println("(aucune)");
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    const char c = Serial.read();
+    if (c == 'd')
+      startDiscovery();
+    else if (c == 'l')
+      listLocos();
+  }
+}
+
+// ---------------------------------------------------------------
+// Setup / Loop
+// ---------------------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
@@ -96,135 +368,29 @@ void setup() {
   Serial.printf("\nFichier   :    %s", __FILE__);
   Serial.printf("\nCompiled  :    %s - %s\n\n", __DATE__, __TIME__);
 
-  //--- Configure ESP32 CAN
   Serial.println("Configure ESP32 CAN");
   ACAN_ESP32_Settings settings(CAN_BITRATE);
-  settings.mRxPin = CAN_RX;
-  settings.mTxPin = CAN_TX;
+  settings.mRxPin = CAN_RX_PIN;
+  settings.mTxPin = CAN_TX_PIN;
+
   const uint32_t errorCode = ACAN_ESP32::can.begin(settings);
-  if (errorCode == 0) {
-    Serial.println("CAN configuration OK!\n");
-  } else {
-    Serial.printf("CAN configuration error 0x%x\n", errorCode);
-    delay(1000);
-    return;
+  if (errorCode != 0) {
+    Serial.printf("CAN configuration error 0x%x\n", static_cast<unsigned>(errorCode));
+    while (true)
+      delay(1000);
   }
+  Serial.println("CAN configuration OK!\n");
 
-  canMsg.hash = 0x2f39;
+  runStartSequence();
 
-  // Send initial CAN commands
-  sendInitialCANCommands();
+  Serial.println("Commandes : d = relancer la decouverte, l = lister les locos");
 }
 
 void loop() {
-  if (ACAN_ESP32::can.receive(frameIn)) {
-    processCANFrame();
-  }
+  CANMessage frame;
+  while (ACAN_ESP32::can.receive(frame))
+    processCanFrame(frame);
+
+  serviceLocos();
+  handleSerial();
 }
-
-void sendInitialCANCommands() {
-  // 2.1 Commande : Système Arrêt
-  delay(1000);
-  memset(canMsg.data, 0x00, 8);
-  sendMsgCan(0x00, 4, canMsg.data);
-
-  // Bootloader CAN
-  delay(1000);
-  memset(canMsg.data, 0x00, 8);
-  canMsg.data[4] = 0x11;
-  sendMsgCan(0x1B, 5, canMsg.data);
-
-  // 2.10 Commande : Système MFX Définir le compteur de nouvelles inscriptions
-  delay(1000);
-  memset(canMsg.data, 0x00, 8);
-  canMsg.data[4] = 0x09;  // Sous-CMD MFX
-  canMsg.data[5] = Loco::comptLoco & 0xFF00;
-  canMsg.data[6] = Loco::comptLoco & 0x00FF;
-  sendMsgCan(0x00, 7, canMsg.data);
-
-  // 3.3 Commande : MFX Verify (pour provoquer un UnBIND)
-  delay(1000);
-  memset(canMsg.data, 0x00, 8);
-  sendMsgCan(0x03, 6, canMsg.data);
-
-  // 2.2 Commande : Système Go
-  delay(1000);
-  memset(canMsg.data, 0x00, 8);
-  canMsg.data[4] = 0x01;  // Go à tous
-  sendMsgCan(0x00, 5, canMsg.data);
-
-  // 3.1 Ordre de mission : Locomotive Discovery
-  delay(1000);
-  memset(canMsg.data, 0x00, 8);
-  canMsg.data[0] = 0x20;  // MFX protocole
-  sendMsgCan(0x00, 1, canMsg.data);
-}
-
-void processCANFrame() {
-  if (frameIn.id >> 16 == 0x03 && frameIn.len == 5) {
-    Serial.printf("Frame ID : 0x%X\n", frameIn.id);
-    Serial.printf("Frame length : %d\n", frameIn.len);
-    Serial.printf("Frame response : %s\n", (frameIn.id & 0x10000) >> 16 ? "true" : "false");
-    Serial.printf("Frame command : 0x%X\n", frameIn.id >> 17);
-    
-    for (byte i = 0; i < frameIn.len; i++) {
-      Serial.printf("  Data [%d] = 0x%X\n", i, frameIn.data[i]);
-    }
-
-    bool found = false;
-    for (byte i = 0; i < nbLocos; i++) {
-      if (memcmp(loco[i].UID, frameIn.data, 4) == 0) {
-        sendMFXBind(loco[i]);
-
-        Serial.printf("Mise a jour d'une loco dans la liste Loc-ID = %d\n", Loco::comptLoco);
-        for (uint8_t el : loco[i].UID) {
-          Serial.printf("MFX-UID : \n");
-          Serial.print("0x");
-          Serial.println(el, HEX);
-        }
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
-      for (byte i = 0; i < nbLocos; i++) {
-        if (loco[i].index == 255) {  // Cherche la première loco non renseignée dans la liste
-          Loco::comptLoco++;         // affecte le n° du compteur +1
-          loco[i].index = i;
-          memcpy(loco[i].UID, frameIn.data, 4);
-          loco[i].locID[0] = (Loco::comptLoco & 0xFF00) >> 8;
-          loco[i].locID[1] = Loco::comptLoco & 0x00FF;
-          Serial.printf("Creation d'une nouvelle loco dans la liste Loc-ID = %d\n", Loco::comptLoco);
-          for (uint8_t el : loco[i].UID) {
-            Serial.printf("MFX-UID : \n");
-            Serial.print("0x");
-            Serial.println(el, HEX);
-          }
-          sendMFXBind(loco[i]);
-          sendMFXVerify(loco[i]);
-          break;
-        }
-      }
-    }
-  }
-}
-
-void sendMFXBind(Loco& loco) {
-  delay(10);
-  memset(canMsg.data, 0x00, 8);
-  memcpy(canMsg.data, loco.UID, 4);
-  canMsg.data[4] = loco.locID[0];
-  canMsg.data[5] = loco.locID[1];
-  sendMsgCan(0x02, 6, canMsg.data);
-}
-
-void sendMFXVerify(Loco& loco) {
-  delay(10);
-  memset(canMsg.data, 0x00, 8);
-  memcpy(canMsg.data, loco.UID, 4);
-  canMsg.data[4] = loco.locID[0];
-  canMsg.data[5] = loco.locID[1];
-  sendMsgCan(0x03, 6, canMsg.data);
-}
-
