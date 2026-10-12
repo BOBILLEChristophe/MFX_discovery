@@ -157,15 +157,25 @@ Par rapport à la v0.3 :
 
 ## Exemple de recherche
 Discovery MFX lance
+
 Nouvelle loco : UID FFE9B194  SID 5  (Loc-ID CAN 0x4005)
+
 Pas de reponse Verify, nouvel essai : UID FFE9B194
+
 Pas de reponse Verify, nouvel essai : UID FFE9B194
+
 [!] Pas de confirmation apres 3 essais : UID FFE9B194
+
 Loco deja connue, nouvelle liaison : UID FFE9B194  SID 5
+
 [!] Verify : SID different pour UID FFE9B194 (recu 7, attendu 5)
+
 [!] Verify : SID different pour UID FFE9B194 (recu 7, attendu 5)
+
 Pas de reponse Verify, nouvel essai : UID FFE9B194
+
 Loco confirmee : UID FFE9B194  SID 5  (Loc-ID CAN 0x4005)
+
 
 ## Limites actuelles
 
